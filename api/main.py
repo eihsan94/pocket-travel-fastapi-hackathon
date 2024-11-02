@@ -1,33 +1,43 @@
+# main.py
+
 from fastapi import FastAPI, Depends, Cookie, Response, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import json
 import re
-from mistralai import Mistral
+import openai
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import logging
 
 # Config
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY environment variable is not set.")
+openai.api_key = OPENAI_API_KEY
 
-nemo_model = "open-mistral-nemo"
-model = "mistral-large-latest"
+# Model configurations
+model = "gpt-4o"
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
 
 # Interfaces
 class KeywordParseRequest(BaseModel):
     input: str
-    session_id: str
-
+    session_id: Optional[str] = None
 
 class TripRequest(BaseModel):
-    days: int
-    startDate: str
+    days: int = 1  # Default to 1 day if not provided
     city: str
     country: str
-    choices: list
-
+    choices: List[dict]
+    start_time: Optional[str] = None  # New field for start time
+    end_time: Optional[str] = None    # New field for end time
+    end_location: Optional[str] = None  # New field for end location
+    preferences: Optional[str] = None  # New field for user preferences
+    language: Optional[str] = None  # New field for language
 
 app = FastAPI()
 origins = [
@@ -44,17 +54,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-client = Mistral(api_key=MISTRAL_API_KEY)
-
 conversation_histories = {}
-
 
 async def get_session_id(session_id: Optional[str] = Cookie(default=None)):
     if session_id is None:
         session_id = str(uuid.uuid4())
     return session_id
-
 
 @app.post("/keyword-search")
 async def KeywordParse(
@@ -65,533 +70,192 @@ async def KeywordParse(
     session_id = data.session_id if data.session_id else session_id
     user_input = data.input
 
+    # System prompt instructing the AI to detect the language automatically
     conversation_history = conversation_histories.get(
         session_id,
         [
             {
                 "role": "system",
                 "content": """
-            You are an agent that identifies key travel plan information from the user-provided information.
-            You need to infer the country code by yourself. If all information is recognized, please ignore the user's original
-            question and return a JSON output that includes 'city', 'country', 'countryCode', 'days', 'startDate', and exit the loop.
-            If any information is missing, prompt the user for the missing details (DO NOT mention JSON).
-            Please DO NOT repeatedly ask for the information the user has already provided!
-            If the user mentions an x-days plan, it means that the user is going to stay x days somewhere.
-            The default year should be 2024 if the user did not mention.
-            Please infer the country from the city by yourself; if you cannot, please ask the user which country it is.
-            Please DO NOT ask the user about the country code; please infer it from the country according to the Google GL Parameter.
-            The JSON format should be:
-            ```json
-            {\
-              "city": string,
-              "country": string,
-              "countryCode": string,
-              "days": int (number),
-              "startDate": "YYYY-MM-dd"
-            }
-            ```
-            """,
+                You are an agent that identifies key travel plan information from the user-provided input.
+                Detect the language of the user's query and respond in the same language.
+                If all required information is recognized, ignore the user's original question and return a JSON output
+                that includes:
+                - 'city'
+                - 'country'
+                - 'countryCode'
+                - 'days' (default to 1 if not specified)
+                - 'start_time' (if specified)
+                - 'end_time' (if specified)
+                - 'end_location' (if specified)
+                - 'preferences' (if specified)
+                - 'language' (the detected language name in English, e.g., 'English', 'Japanese')
+
+                Assume a 1-day trip if the user does not specify the number of days. Do not ask for this information unless explicitly stated by the user.
+
+                If any information is missing, prompt the user for the missing details without mentioning JSON format.
+                - Do not repeatedly ask for information the user has already provided.
+                - If the user mentions an x-day plan, it means that they intend to stay x days in a location.
+                - Use 2024 as the default year if none is specified by the user.
+                - Try to infer the country from the city; if unable, ask the user which country it is.
+                - Do not ask the user for the country code; infer it from the country according to the Google GL Parameter.
+
+                The response format should be in JSON, as follows:
+                ```json
+                {{
+                  "city": string,
+                  "country": string,
+                  "countryCode": string,
+                  "days": int,
+                  "start_time": string (if specified),
+                  "end_time": string (if specified),
+                  "end_location": string (if specified),
+                  "preferences": string (if specified),
+                  "language": string
+                }}
+                """
             }
         ],
     )
 
-    print(conversation_history)
-
-    # Add user's input to the conversation history
     conversation_history.append({"role": "user", "content": user_input})
 
     try:
-        # Call the Mistral API
-        chat_response = client.chat.complete(model=model, messages=conversation_history)
+        logging.info("Calling OpenAI API for keyword parsing")
+        chat_response = openai.chat.completions.create(
+            model=model,
+            messages=conversation_history,
+        )
 
-        if chat_response is None or not chat_response.choices:
+        if not chat_response.choices:
+            logging.error("No response from OpenAI API")
             raise HTTPException(
                 status_code=500, detail="Failed to get a response from the assistant"
             )
 
-        # Extract the assistant's response
         response_content = chat_response.choices[0].message.content.strip()
-
-        # Add assistant's response to the conversation history
         conversation_history.append({"role": "assistant", "content": response_content})
-
-        # Save the updated conversation history
         conversation_histories[session_id] = conversation_history
-
-        # Set the session ID cookie
         response.set_cookie(key="session_id", value=session_id)
 
-        # Try to extract JSON from the assistant's response
         json_match = re.search(r"```json\n({.*?})\n```", response_content, re.DOTALL)
 
         if json_match:
             try:
                 json_string = json_match.group(1)
                 extracted_info = json.loads(json_string)
-                print
                 return extracted_info
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as json_err:
+                logging.error("JSON decode error: %s", json_err)
                 raise HTTPException(
-                    status_code=500,
-                    detail="Failed to extract JSON from the assistant's response",
+                    status_code=500, detail="Failed to parse JSON response from assistant",
                 )
         else:
-            # Return the assistant's response text
             return {"response": response_content, "session_id": session_id}
+    except openai.APIError as api_err:
+        logging.error("OpenAI API error: %s", api_err)
+        raise HTTPException(
+            status_code=500, detail="An error occurred with the OpenAI API",
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occured: {e}")
-
-
-@app.post("/itinerary-slim")
-async def PlanItinerary(data: TripRequest, response: Response):
-    print(data)
-    # Destructure data
-    
-    system_message = {
-        "role": "system",
-        "content": (
-            """
-            "You will receive a JSON file containing multiple items. Each item includes keywords such as 'category' (e.g., activity/lunch/dinner),'title','rating','address','operating hours', and 'discription'. In addition to the JSON file, you will also be given the number of travel days and the starting date. "
-            "First, you need to summarize the description and the rating for each item. Then, based on the number of travel days, the starting date, and the summary you made, you will create a travel plan for the user. "
-            "The travel plan should include: 'date', 'starting time', 'end time', 'title', and 'description' (which is the summary you made). "
-            "Ensure that each day includes lunch and dinner activities. "
-            "Limit the number of slots of each day to 3. "
-            "Each title's description should be around 10 words. "
-             The output should be:
-            ```json
-            {\
-                "itineraryItems": [
-                    {
-                        "day": 1,
-                        "dates": "2024-10-01",
-                        "city": "Tokyo",
-                        "image": thumbnail,
-                        "slots": [
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "09:00 AM",
-                            "endTime": "10:30 AM"
-                            },
-                            "description": "Description of the place",
-                        },
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "11:00 AM",
-                            "endTime": "12:30 PM"
-                            },
-                            "description": "Description of the place",
-                        }
-                        ]
-                    },
-                    {
-                        "day": 2,
-                        "dates": "2024-10-02",
-                        "city": "Tokyo",
-                        "image": "thumbnail",
-                        "slots": [
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "01:00 PM",
-                            "endTime": "02:30 PM"
-                            },
-                            "description": "Description of the place",
-                        }
-                        ]
-                    }
-                ]            
-            }
-            ```
-            """
-        )
-    }
-
-    user_content_template = (
-        f"This is a {data.days} day trip starting from {data.startDate}, and the JSON file is {data.choices}"
-    )
-
-
-
-    try:
-        chat_response = client.chat.complete(
-            model=model,
-            messages=[
-                system_message,
-                {
-                    "role": "user",
-                    "content": user_content_template,
-                },
-            ],
+        logging.error("Unexpected error: %s", e)
+        raise HTTPException(
+            status_code=500, detail=f"An unexpected error occurred: {e}"
         )
 
-        if chat_response is None or not chat_response.choices:
-            raise HTTPException(
-                status_code=500, detail="Failed to get a response from the assistant"
-            )
-        print(chat_response)
-        # Extract the assistant's response
-        response_content = chat_response.choices[0].message.content.strip()
-
-        # Try to extract JSON from the assistant's response
-        json_match = re.search(r"```json\n({.*?})\n```", response_content, re.DOTALL)
-
-        if json_match:
-            try:
-                json_string = json_match.group(1)
-                extracted_info = json.loads(json_string)
-                return extracted_info
-            except json.JSONDecodeError:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Failed to extract JSON from the assistant's response",
-                )
-        else:
-            # Return the assistant's response text
-            return {"response": response_content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occured: {e}")
-
-@app.post("/itinerary-mini")
-async def PlanItinerary(data: TripRequest, response: Response):
-    print(data)
-    # Destructure data
-    
-    system_message = {
-        "role": "system",
-        "content": (
-            """
-            "You will receive a JSON file containing multiple items. Each item includes keywords such as 'category' (e.g., activity/lunch/dinner),'title','rating','address','operating hours', and 'discription'. In addition to the JSON file, you will also be given the number of travel days and the starting date. "
-            "First, you need to summarize the discription and the rating for each item. Then, based on the number of travel days, the starting date, and the summary you made, you will create a travel plan for the user. "
-            "The travel plan should include: 'date', 'starting time', 'end time', 'title', and 'description' (which is the summary you made). "
-            "Ensure that each day includes lunch and dinner activities. "
-            "Limit the number of slots of each day to 3. "
-            "Each title's description should be around 10 words. "
-             The output should be:
-            ```json
-            {\
-                "itineraryItems": [
-                    {
-                        "day": 1,
-                        "dates": "2024-10-01",
-                        "city": "Tokyo",
-                        "image": thumbnail,
-                        "slots": [
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "09:00 AM",
-                            "endTime": "10:30 AM"
-                            },
-                            "description": "Description of the place",
-                        },
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "11:00 AM",
-                            "endTime": "12:30 PM"
-                            },
-                            "description": "Description of the place",
-                        }
-                        ]
-                    },
-                    {
-                        "day": 2,
-                        "dates": "2024-10-02",
-                        "city": "Tokyo",
-                        "image": "thumbnail",
-                        "slots": [
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "01:00 PM",
-                            "endTime": "02:30 PM"
-                            },
-                            "description": "Description of the place",
-                        }
-                        ]
-                    }
-                ]            
-            }
-            ```
-            """
-        )
-    }
-
-    user_content_template = (
-        f"This is a {data.days} day trip starting from {data.startDate}, and the JSON file is {data.choices}"
-    )
-
-
-
-    try:
-        chat_response = client.chat.complete(
-            model=model,
-            messages=[
-                system_message,
-                {
-                    "role": "user",
-                    "content": user_content_template,
-                },
-            ],
-        )
-
-        if chat_response is None or not chat_response.choices:
-            raise HTTPException(
-                status_code=500, detail="Failed to get a response from the assistant"
-            )
-        print(chat_response)
-        # Extract the assistant's response
-        response_content = chat_response.choices[0].message.content.strip()
-
-        # Try to extract JSON from the assistant's response
-        json_match = re.search(r"```json\n({.*?})\n```", response_content, re.DOTALL)
-
-        if json_match:
-            try:
-                json_string = json_match.group(1)
-                extracted_info = json.loads(json_string)
-                return extracted_info
-            except json.JSONDecodeError:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Failed to extract JSON from the assistant's response",
-                )
-        else:
-            # Return the assistant's response text
-            return {"response": response_content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occured: {e}")
-
-
-@app.post("/itinerary-changed")
-async def PlanItinerary(data: TripRequest, response: Response):
-    print(data)
-    # Destructure data
-    
-    system_message = {
-        "role": "system",
-        "content": (
-            """
-            "You will receive a JSON file containing multiple items. Each item includes keywords such as 'category' (e.g., activity/lunch/dinner),'title','rating','address','operating hours', and 'discription'. In addition to the JSON file, you will also be given the number of travel days and the starting date. "
-            "First, you need to summarize the discription and the rating for each item. Then, based on the number of travel days, the starting date, and the summary you made, you will create a travel plan for the user. "
-            "The travel plan should include: 'date', 'starting time', 'end time', 'title', and 'description' (which is the summary you made). "
-            "Ensure that each day includes lunch and dinner activities. "
-            "Before you generate the final json file, you need to make sure each interval between itineraries should not exceed one hour. Please add internal json element with key timeIntervals with all the intervals to double-check. "
-            "Each title's description should be around 50 words. "
-             The output should be:
-            ```json
-            {\
-                "itineraryItems": [
-                    {
-                        "day": 1,
-                        "dates": "2024-10-01",
-                        "city": "Tokyo",
-                        "image": thumbnail,
-                        "slots": [
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "09:00 AM",
-                            "endTime": "10:30 AM"
-                            },
-                            "description": "Description of the place",
-                        },
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "11:00 AM",
-                            "endTime": "12:30 PM"
-                            },
-                            "description": "Description of the place",
-                        }
-                        ]
-                    },
-                    {
-                        "day": 2,
-                        "dates": "2024-10-02",
-                        "city": "Tokyo",
-                        "image": "thumbnail",
-                        "slots": [
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "01:00 PM",
-                            "endTime": "02:30 PM"
-                            },
-                            "description": "Description of the place",
-                        }
-                        ]
-                    }
-                ]            
-            }
-            ```
-            """
-        )
-    }
-
-    user_content_template = (
-        f"This is a {data.days} day trip starting from {data.startDate}, and the JSON file is {data.choices}"
-    )
-
-
-
-    try:
-        chat_response = client.chat.complete(
-            model=model,
-            messages=[
-                system_message,
-                {
-                    "role": "user",
-                    "content": user_content_template,
-                },
-            ],
-        )
-
-        if chat_response is None or not chat_response.choices:
-            raise HTTPException(
-                status_code=500, detail="Failed to get a response from the assistant"
-            )
-        print(chat_response)
-        # Extract the assistant's response
-        response_content = chat_response.choices[0].message.content.strip()
-
-        # Try to extract JSON from the assistant's response
-        json_match = re.search(r"```json\n({.*?})\n```", response_content, re.DOTALL)
-
-        if json_match:
-            try:
-                json_string = json_match.group(1)
-                extracted_info = json.loads(json_string)
-                return extracted_info
-            except json.JSONDecodeError:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Failed to extract JSON from the assistant's response",
-                )
-        else:
-            # Return the assistant's response text
-            return {"response": response_content}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occured: {e}")
-
-
+# Adjusted itinerary endpoint without the start date
 @app.post("/itinerary")
 async def PlanItinerary(data: TripRequest, response: Response):
-    print(data)
-    # Destructure data
-    
     system_message = {
         "role": "system",
-        "content": (
-            """
-            "You will receive a JSON file containing multiple items. Each item includes keywords such as 'category' (e.g., activity/lunch/dinner),'title','rating','address','operating hours', and 'discription'. In addition to the JSON file, you will also be given the number of travel days and the starting date. "
-            "First, you need to summarize the discription and the rating for each item. Then, based on the number of travel days, the starting date, and the summary you made, you will create a travel plan for the user. "
-            "The travel plan should include: 'date', 'starting time', 'end time', 'title', and 'description' (which is the summary you made). "
-            "Ensure that each day includes lunch and dinner activities. "
-            "When planning each place, you need to consider the address of each title and the commute time from title to title. Try to avoid scheduling two titles that are far apart consecutively, and make sure to account for commute time in the starting time and ending time. Each interval between itineraries should not exceed one hour. "
-            "Each title's description should be around 50 words. "
-             The output should be:
+        "content": """
+            Detect the language of the user's input and respond in the same language.
+
+            You will receive a JSON file containing multiple items. Each item includes:
+            - 'category' (e.g., activity, lunch, dinner)
+            - 'title'
+            - 'rating'
+            - 'address'
+            - 'operating hours'
+            - 'description'
+
+            You will also receive the number of travel days, a specific start time, end time, end location, and any user preferences if provided.
+
+            Plan the itinerary within the specified timeframe and end at the specified location if provided.
+            If the user mentions a start time or end time, adjust activities to fit within this window.
+            Summarize the description and rating for each item, and organize the activities within the time constraints.
+
+            Additional Instructions:
+            - Ensure that each day includes lunch and dinner activities.
+            - Consider the address and commute time between locations, avoiding scheduling locations that are far apart consecutively.
+            - Make sure to account for commute time in the starting and ending times.
+            - Each interval between activities should not exceed one hour.
+            - Limit each title's description to around 50 words.
+            - Only include activities that match the user's preferences (e.g., indoor activities).
+
+            The output should be:
             ```json
-            {\
+            {{
                 "itineraryItems": [
-                    {
+                    {{
                         "day": X,
                         "dates": "YYYY-MM-DD",
                         "city": "City Name",
                         "image": "image URL from the json",
                         "slots": [
-                        {
+                        {{
                             "data_id": "data_id",
                             "location": "Title of the place",
-                            "time": {
+                            "time": {{
                             "startTime": "HH:MM AM/PM",
                             "endTime": "HH:MM AM/PM"
-                            },
+                            }},
                             "description": "Description of the place",
-                        },
-                        {
+                            "language": "the detected language name in English, e.g., 'English', 'Japanese'"
+                        }},
+                        {{
                             "data_id": "data_id",
                             "location": "Title of the place",
-                            "time": {
+                            "time": {{
                             "startTime": "HH:MM AM/PM",
                             "endTime": "HH:MM AM/PM"
-                            },
+                            }},
                             "description": "Description of the place",
-                        }
+                            "language": "the detected language name in English, e.g., 'English', 'Japanese'"
+                        }}
                         ]
-                    },
-                    {
-                        "day": X,
-                        "dates": "YYYY-MM-DD",
-                        "city": "City Name",
-                        "image": "image URL from the json",
-                        "slots": [
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "HH:MM AM/PM",
-                            "endTime": "HH:MM AM/PM"
-                            },
-                            "description": "Description of the place",
-                        },
-                        {
-                            "data_id": "data_id",
-                            "location": "Title of the place",
-                            "time": {
-                            "startTime": "HH:MM AM/PM",
-                            "endTime": "HH:MM AM/PM"
-                            },
-                            "description": "Description of the place",
-                        }
-                        ]
-                    }
-                    
+                    }}
                 ]            
-            }
-            ```
+            }}
             """
-        )
     }
 
     user_content_template = (
-        f"This is a {data.days} day trip starting from {data.startDate}, and the JSON file is {data.choices}"
+        f"This is a {data.days} day trip in {data.city}."
+        + (f" The start time is {data.start_time}." if data.start_time else "")
+        + (f" The end time is {data.end_time}." if data.end_time else "")
+        + (f" The itinerary should end at {data.end_location}." if data.end_location else "")
+        + (f" The user preferences are: {data.preferences}." if data.preferences else "")
+        + f" The JSON file is {data.choices}."
     )
-
-
-
+    logging.info("User content template: %s", user_content_template)
     try:
-        chat_response = client.chat.complete(
-            model=nemo_model,
+        logging.info("Calling OpenAI API for itinerary planning")
+        chat_response = openai.chat.completions.create(
+            model=model,
             messages=[
                 system_message,
-                {
-                    "role": "user",
-                    "content": user_content_template,
-                },
+                {"role": "user", "content": user_content_template},
             ],
         )
 
-        if chat_response is None or not chat_response.choices:
+        if not chat_response.choices:
+            logging.error("No response from OpenAI API")
             raise HTTPException(
                 status_code=500, detail="Failed to get a response from the assistant"
             )
-        print(chat_response)
-        # Extract the assistant's response
-        response_content = chat_response.choices[0].message.content.strip()
 
-        # Try to extract JSON from the assistant's response
+        response_content = chat_response.choices[0].message.content.strip()
         json_match = re.search(r"```json\n({.*?})\n```", response_content, re.DOTALL)
 
         if json_match:
@@ -599,13 +263,22 @@ async def PlanItinerary(data: TripRequest, response: Response):
                 json_string = json_match.group(1)
                 extracted_info = json.loads(json_string)
                 return extracted_info
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as json_err:
+                logging.error("JSON decode error: %s", json_err)
                 raise HTTPException(
                     status_code=500,
-                    detail="Failed to extract JSON from the assistant's response",
+                    detail="Failed to parse JSON response from assistant",
                 )
         else:
-            # Return the assistant's response text
             return {"response": response_content}
+    except openai.APIError as api_err:
+        logging.error("OpenAI API error: %s", api_err)
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred with the OpenAI API",
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An unexpected error occured: {e}")
+        logging.error("Unexpected error: %s", e)
+        raise HTTPException(
+            status_code=500, detail=f"An unexpected error occurred: {e}"
+        )

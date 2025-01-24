@@ -10,8 +10,10 @@ import uuid
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import logging
-
+from dotenv import load_dotenv
 # Config
+load_dotenv()  # Load environment variables from .env file
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable is not set.")
@@ -44,6 +46,7 @@ origins = [
     "http://localhost:3000",  # Frontend origin
     "https://pocket-travel-fastapi-hackathon.vercel.app",
     "https://pocket-travel-hackathon.vercel.app",
+    "https://pocket-payload.vercel.app",
 ]
 
 app.add_middleware(

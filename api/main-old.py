@@ -32,8 +32,8 @@ class TripRequest(BaseModel):
 app = FastAPI()
 origins = [
     "http://localhost:3000",  # Frontend origin
-    "https://pocket-travel-fastapi-hackathon.vercel.app",
-    "https://pocket-travel-hackathon.vercel.app",
+    "https://pocket-japan-fastapi-hackathon.vercel.app",
+    "https://pocket-japan.vercel.app",
 ]
 
 app.add_middleware(

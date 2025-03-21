@@ -34,6 +34,7 @@ origins = [
     "http://localhost:3000",  # Frontend origin
     "https://pocket-japan-fastapi-hackathon.vercel.app",
     "https://pocket-japan.vercel.app",
+    "https://lostinmigration.com",
 ]
 
 app.add_middleware(

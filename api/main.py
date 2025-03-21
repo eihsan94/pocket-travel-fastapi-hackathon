@@ -47,6 +47,7 @@ origins = [
     "https://pocket-japan-fastapi-hackathon.vercel.app",
     "https://pocket-japan-hackathon.vercel.app",
     "https://pocket-japan.vercel.app",
+    "https://lostinmigration.com",
 ]
 
 app.add_middleware(

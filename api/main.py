@@ -43,12 +43,13 @@ class TripRequest(BaseModel):
 
 app = FastAPI()
 origins = [
-    "http://localhost:3000",  # Frontend origin
-    "https://pocket-japan-fastapi-hackathon.vercel.app",
-    "https://pocket-japan-hackathon.vercel.app",
-    "https://pocket-japan.vercel.app",
     "https://lostinmigration.com",
+    "https://pocket-japan-fastapi-hackathon.vercel.app"
 ]
+
+# Add localhost:3000 to origins if in development environment
+if os.getenv("ENVIRONMENT") == "development":
+    origins.append("http://localhost:3000")
 
 app.add_middleware(
     CORSMiddleware,
